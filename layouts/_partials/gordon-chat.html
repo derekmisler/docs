@@ -14,17 +14,39 @@
     error: null,
     messages: $persist([]).using(sessionStorage).as('gordon-messages'),
     currentQuestion: '',
-    threadId: $persist(null).using(sessionStorage).as('gordon-threadId'),
+    threadId: null,
+    recoveredThreadId: null,
+    isRecovering: false,
     includePageContext: $persist(true).using(sessionStorage).as('gordon-includePageContext'),
     maxTurnsPerThread: 10,
 
+    getThreadIdFromCookie() {
+      const match = document.cookie.match(/(?:^|;\s*)gordon-thread-id=([^;]+)/)
+      return match ? decodeURIComponent(match[1]) : null
+    },
+
+    setThreadIdCookie(id) {
+      // Only set domain=.docker.com on actual docker.com hosts; omit on localhost
+      const isDockerDomain = window.location.hostname.endsWith('.docker.com') || window.location.hostname === 'docker.com'
+      const domainAttr = isDockerDomain ? '; domain=.docker.com' : ''
+      document.cookie = `gordon-thread-id=${encodeURIComponent(id)}; path=/${domainAttr}; max-age=2592000; SameSite=Lax`
+    },
+
+    clearThreadIdCookie() {
+      const isDockerDomain = window.location.hostname.endsWith('.docker.com') || window.location.hostname === 'docker.com'
+      const domainAttr = isDockerDomain ? '; domain=.docker.com' : ''
+      document.cookie = `gordon-thread-id=; path=/${domainAttr}; max-age=0; SameSite=Lax`
+    },
+
     init() {
+      this.threadId = this.getThreadIdFromCookie()
       // Clean up any streaming messages that might be persisted
       this.messages = this.messages.filter(m => !m.isStreaming)
 
-      // Watch for store changes to focus input
+      // Watch for store changes to focus input and attempt thread recovery
       this.$watch('$store.gordon.isOpen', (isOpen) => {
         if (isOpen) {
+          this.recoverThread()
           this.$nextTick(() => {
             this.$refs.input?.focus()
           })
@@ -49,6 +71,42 @@
           this.$store.gordon.autoSubmit = false
         }
       })
+    },
+
+    async recoverThread() {
+      const threadId = this.getThreadIdFromCookie()
+      if (!threadId) return
+      if (this.recoveredThreadId === threadId) return  // already attempted
+      if (this.messages.length > 0) return             // session already has messages
+
+      this.recoveredThreadId = threadId
+      this.isRecovering = true
+      try {
+        const resp = await fetch(`${window.GORDON_BASE_URL}/public/threads/${threadId}`)
+        if (resp.status === 404) {
+          this.clearThreadIdCookie()
+          this.threadId = null
+          return
+        }
+        if (!resp.ok) {
+          this.recoveredThreadId = null  // allow retry on transient errors
+          return
+        }
+        const data = await resp.json()
+        this.messages = (data.messages ?? []).map(m => ({
+          role: m.role,
+          content: m.content,
+          isStreaming: false,
+          questionAnswerId: m.question_answer_id ?? null,
+          feedback: null,
+          copied: false
+        }))
+        this.threadId = threadId
+      } catch {
+        this.recoveredThreadId = null  // allow retry on network errors
+      } finally {
+        this.isRecovering = false
+      }
     },
 
     getTurnCount() {
@@ -177,7 +235,9 @@
 
       const response = await fetch(window.GORDON_BASE_URL + '/public/ask', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify(payload)
       })
 
@@ -210,7 +270,8 @@
             // Capture thread_id for new conversations
             if (parsed.thread_id) {
               if (isNewConversation) {
-                this.threadId = parsed.thread_id  // $persist auto-saves to sessionStorage
+                this.threadId = parsed.thread_id
+                this.setThreadIdCookie(parsed.thread_id)
               } else if (parsed.thread_id !== this.threadId) {
                 console.warn('Backend returned unexpected thread_id:', parsed.thread_id)
               }
@@ -246,11 +307,21 @@
       this.messages[responseIndex].isStreaming = false
     },
 
-    clearChat() {
-      if (confirm('Clear all messages?')) {
-        this.messages = []      // $persist auto-saves empty array
-        this.threadId = null    // $persist auto-removes from sessionStorage
-        this.error = null
+    async clearChat() {
+      const threadId = this.threadId
+      // Reset state immediately (optimistic)
+      this.messages = []
+      this.threadId = null
+      this.error = null
+      this.recoveredThreadId = null
+      this.clearThreadIdCookie()
+      // Best-effort DELETE to backend
+      if (threadId) {
+        try {
+          await fetch(`${window.GORDON_BASE_URL}/public/threads/${threadId}`, { method: 'DELETE' })
+        } catch {
+          // Ignore — cookie already cleared so thread won't be recovered
+        }
       }
     },
 
@@ -346,10 +417,10 @@
       <div class="flex items-center gap-2">
         <button
           @click="clearChat()"
-          title="Clear chat"
+          title="New session"
+          aria-label="New session"
           class="cursor-pointer rounded p-2 text-white/80 transition-colors hover:bg-blue-500 hover:text-white"
-          :disabled="messages.length === 0"
-          :class="{ 'opacity-50 cursor-not-allowed': messages.length === 0 }"
+          x-show="(messages.length > 0 || threadId) && !isRecovering"
         >
           <span class="icon-svg">
             {{ partialCached "icon" "refresh" "refresh" }}
@@ -374,8 +445,18 @@
       class="flex-1 space-y-4 p-6"
       :class="{ 'overflow-y-auto': messages.length > 0 }"
     >
+      <!-- Recovery spinner -->
+      <template x-if="isRecovering">
+        <div class="flex items-center justify-center py-8 text-gray-500 dark:text-gray-400">
+          <span class="icon-svg animate-spin mr-2">
+            {{ partialCached "icon" "progress_activity" "progress_activity" }}
+          </span>
+          <span class="text-sm">Restoring your conversation...</span>
+        </div>
+      </template>
+
       <!-- Welcome message when empty -->
-      <template x-if="messages.length === 0">
+      <template x-if="messages.length === 0 && !isRecovering">
         <div
           class="flex h-full flex-col items-center justify-center text-center"
         >
